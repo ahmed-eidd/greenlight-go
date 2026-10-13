@@ -4,8 +4,12 @@ import (
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
+	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/julienschmidt/httprouter"
 	"greenlight.ahmedeid.net/internal/models"
@@ -49,4 +53,116 @@ func (app *application) writeJSON(w http.ResponseWriter, status int, data envelo
 	w.Write(js)
 
 	return nil
+}
+
+func (app *application) readJSON(w http.ResponseWriter, r *http.Request, dst any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, 1_048_576) // == (1MB)
+
+	opts := []json.Options{
+		json.RejectUnknownMembers(true), json.WithUnmarshalers(models.RuntimeUnmarshaler),
+	}
+
+	err := json.UnmarshalRead(r.Body, dst, opts...)
+	if err != nil {
+		var synErr *jsontext.SyntacticError
+		var semErr *json.SemanticError
+		var maxBtyesErr *http.MaxBytesError
+		switch {
+		case errors.As(err, &maxBtyesErr):
+			return convertMaxBytesErrorToBadRequest(maxBtyesErr)
+		case errors.As(err, &synErr):
+			return convertSyntacticErrorToBadRequest(synErr)
+		case errors.As(err, &semErr) && isClientSemantciError(semErr):
+			return convertSemanticErrorToBadRequest(semErr)
+		default:
+			return err
+		}
+	}
+
+	return nil
+}
+
+func convertSyntacticErrorToBadRequest(synErr *jsontext.SyntacticError) *badRequestError {
+	if errors.Is(synErr, io.ErrUnexpectedEOF) && synErr.ByteOffset == 0 {
+		return &badRequestError{Message: "request body must not be empty"}
+	}
+
+	var buf strings.Builder
+	pointer := string(synErr.JSONPointer)
+
+	if pointer == "" {
+		pointer = "request body"
+	}
+
+	fmt.Fprintf(&buf, "%s contains malformed JSON", pointer)
+
+	offset := synErr.ByteOffset
+
+	if offset > 0 {
+		fmt.Fprintf(&buf, " at position %d", offset)
+	}
+
+	detail := synErr.Err.Error()
+	if detail == "unexpected EOF" {
+		detail = "unexpected end of JSON"
+	}
+
+	fmt.Fprintf(&buf, ": %s", detail)
+
+	return &badRequestError{Message: buf.String()}
+}
+
+func isClientSemantciError(semErr *json.SemanticError) bool {
+	if semErr.Err != nil {
+		msgs := []string{
+			"ambiguous object member name",
+			"cannot derive concrete type for nil interface with finite type set",
+			"Go struct has no exported fields",
+			"value must be passed as a non-nil pointer reference",
+		}
+
+		if slices.Contains(msgs, semErr.Err.Error()) {
+			return false
+		}
+
+	}
+
+	if semErr.ByteOffset == 0 && semErr.JSONKind != jsontext.KindBeginObject {
+		return true
+	}
+
+	if semErr.ByteOffset > 0 {
+		return true
+	}
+
+	return false
+}
+
+func convertSemanticErrorToBadRequest(semErr *json.SemanticError) *badRequestError {
+	if errors.Is(semErr, json.ErrUnknownName) {
+		return &badRequestError{
+			Message: fmt.Sprintf("request body contains unknown key %s", semErr.JSONPointer),
+		}
+	}
+	var buf strings.Builder
+
+	pointer := string(semErr.JSONPointer)
+	if pointer == "" {
+		pointer = "request body"
+	}
+
+	fmt.Fprintf(&buf, "%s contains an unsupported JSON type or invalid value", pointer)
+
+	offset := semErr.ByteOffset
+	if offset > 0 {
+		fmt.Fprintf(&buf, " at position %d", offset)
+	}
+
+	return &badRequestError{Message: buf.String()}
+}
+
+func convertMaxBytesErrorToBadRequest(maxBytesErr *http.MaxBytesError) *badRequestError {
+	return &badRequestError{
+		Message: fmt.Sprintf("request body must not be larger than %d bytes", maxBytesErr.Limit),
+	}
 }
