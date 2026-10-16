@@ -2,6 +2,7 @@ package models
 
 import (
 	"database/sql"
+	"errors"
 	"time"
 
 	"github.com/lib/pq"
@@ -45,13 +46,38 @@ type MovieModel struct {
 
 func (m MovieModel) Insert(movie Movie) (Movie, error) {
 	query := `INSERT INTO movies (title, year, runtime, genres) VALUES ($1, $2, $3, $4) RETURNING id, created_at, version`
-	args := []any{ movie.Title, movie.Year, movie.Runtime, pq.Array(movie.Genres)}
+	args := []any{movie.Title, movie.Year, movie.Runtime, pq.Array(movie.Genres)}
 	err := m.DB.QueryRow(query, args...).Scan(&movie.ID, &movie.CreatedAt, &movie.Version)
 	return movie, err
 }
 
 func (m MovieModel) Get(id int) (Movie, error) {
-	return Movie{}, nil
+	if id < 1 {
+		return Movie{}, ErrRecondNotFound
+	}
+	query := `SELECT id, created_at, title, year, runtime, genres, version FROM movies WHERE id = $1`
+	var movie Movie
+
+	err := m.DB.QueryRow(query, id).Scan(
+		&movie.ID,
+		&movie.CreatedAt,
+		&movie.Title,
+		&movie.Year,
+		&movie.Runtime,
+		pq.Array(&movie.Genres),
+		&movie.Version,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return Movie{}, ErrRecondNotFound
+		default:
+			return Movie{}, err
+		}
+	}
+
+	return movie, nil
+
 }
 
 func (m MovieModel) Update(movie Movie) (Movie, error) {
